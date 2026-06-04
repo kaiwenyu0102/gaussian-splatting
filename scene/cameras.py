@@ -43,9 +43,9 @@ class Camera(nn.Module):
         gt_image = resized_image_rgb[:3, ...]
         self.alpha_mask = None
         if resized_image_rgb.shape[0] == 4:
-            self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
-        else: 
-            self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
+            self.alpha_mask = resized_image_rgb[3:4, ...].cpu()
+        else:
+            self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...]).cpu()
 
         if train_test_exp and is_test_view:
             if is_test_dataset:
@@ -53,7 +53,7 @@ class Camera(nn.Module):
             else:
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
-        self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        self.original_image = gt_image.clamp(0.0, 1.0).cpu()
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
@@ -75,7 +75,7 @@ class Camera(nn.Module):
 
             if self.invdepthmap.ndim != 2:
                 self.invdepthmap = self.invdepthmap[..., 0]
-            self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
+            self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).cpu()
 
         self.zfar = 100.0
         self.znear = 0.01
