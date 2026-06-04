@@ -15,6 +15,19 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
+# Check if the installed rasterizer supports antialiasing
+try:
+    _test_settings = GaussianRasterizationSettings(
+        image_height=1, image_width=1, tanfovx=0.5, tanfovy=0.5,
+        bg=[0,0,0], scale_modifier=1.0, viewmatrix=torch.eye(4).cuda(),
+        projmatrix=torch.eye(4).cuda(), sh_degree=0,
+        campos=torch.zeros(3).cuda(), prefiltered=False, debug=False,
+        antialiasing=False
+    )
+    _RASTERIZER_SUPPORTS_AA = True
+except TypeError:
+    _RASTERIZER_SUPPORTS_AA = False
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
     Render the scene. 
@@ -33,21 +46,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug,
-        antialiasing=pipe.antialiasing
-    )
+    raster_settings_kwargs = {
+        "image_height": int(viewpoint_camera.image_height),
+        "image_width": int(viewpoint_camera.image_width),
+        "tanfovx": tanfovx,
+        "tanfovy": tanfovy,
+        "bg": bg_color,
+        "scale_modifier": scaling_modifier,
+        "viewmatrix": viewpoint_camera.world_view_transform,
+        "projmatrix": viewpoint_camera.full_proj_transform,
+        "sh_degree": pc.active_sh_degree,
+        "campos": viewpoint_camera.camera_center,
+        "prefiltered": False,
+        "debug": pipe.debug,
+    }
+    if _RASTERIZER_SUPPORTS_AA:
+        raster_settings_kwargs["antialiasing"] = pipe.antialiasing
+
+    raster_settings = GaussianRasterizationSettings(**raster_settings_kwargs)
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
