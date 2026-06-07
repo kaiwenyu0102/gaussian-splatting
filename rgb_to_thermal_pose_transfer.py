@@ -256,6 +256,9 @@ def main():
     parser.add_argument("--per_image_camera", action="store_true",
         help="Create one camera per image (all with same intrinsics). "
              "Required for COLMAP 4.x point_triangulator compatibility (avoids frame/rig conflicts).")
+    parser.add_argument("--skip_rigs_frames", action="store_true",
+        help="Skip writing rigs.bin and frames.bin. Use this when running "
+             "point_triangulator after cleaning database frame/rig data.")
     args = parser.parse_args()
     
     # ============================================================
@@ -469,9 +472,7 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # cameras.bin: Thermal intrinsics (1 shared camera for COLMAP 4.x compatibility)
-    # COLMAP 4.x point_triangulator requires matching frame/rig structures,
-    # so we use 1 shared camera + explicit frames/rigs files.
+    # cameras.bin: Thermal intrinsics (1 shared camera)
     new_cameras = {1: th_cam}
     write_cameras_binary(new_cameras, os.path.join(args.output_dir, "cameras.bin"))
     print(f"[INFO] Created 1 shared camera")
@@ -480,19 +481,22 @@ def main():
     for img_id in new_thermal_images:
         new_thermal_images[img_id]["camera_id"] = 1
 
-    # rigs.bin: 1 rig with 1 camera (single-camera rig)
-    # rig_id=1 matches what COLMAP 4.x feature_extractor creates
-    new_rigs = {1: [(1, [0.0, 0.0, 0.0])]}  # rig_id=1, camera_id=1, ref_tvec=[0,0,0]
-    write_rigs_binary(new_rigs, os.path.join(args.output_dir, "rigs.bin"))
-    print(f"[INFO] Created 1 rig (single-camera)")
+    if not args.skip_rigs_frames:
+        # rigs.bin: 1 rig with 1 camera
+        new_rigs = {1: [(1, [0.0, 0.0, 0.0])]}  # rig_id=1, camera_id=1, ref_tvec=[0,0,0]
+        write_rigs_binary(new_rigs, os.path.join(args.output_dir, "rigs.bin"))
+        print(f"[INFO] Created 1 rig (single-camera)")
 
-    # frames.bin: 305 frames, each with 1 data_id
-    # frame_id = image_id, rig_id = 1, data_id = (image_id, camera_id=1)
-    new_frames = {}
-    for img_id in sorted(new_thermal_images.keys()):
-        new_frames[img_id] = (1, [(img_id, 1)])  # rig_id=1, data_ids=[(img_id, camera_id=1)]
-    write_frames_binary(new_frames, os.path.join(args.output_dir, "frames.bin"))
-    print(f"[INFO] Created {len(new_frames)} frames")
+        # frames.bin: 305 frames
+        new_frames = {}
+        for img_id in sorted(new_thermal_images.keys()):
+            new_frames[img_id] = (1, [(img_id, 1)])
+        write_frames_binary(new_frames, os.path.join(args.output_dir, "frames.bin"))
+        print(f"[INFO] Created {len(new_frames)} frames")
+    else:
+        new_rigs = {}
+        new_frames = {}
+        print(f"[INFO] Skipped rigs.bin and frames.bin (--skip_rigs_frames)")
     
     # images.bin: RGB poses + Thermal filenames + Thermal camera_id
     write_images_binary(new_thermal_images, os.path.join(args.output_dir, "images.bin"))
@@ -504,8 +508,12 @@ def main():
     print(f"DONE! Output at {args.output_dir}")
     print(f"  Cameras: {len(new_cameras)} (shared Thermal intrinsics)")
     print(f"  Images:  {len(new_thermal_images)} (305 with RGB poses)")
-    print(f"  Rigs:    {len(new_rigs)} (single-camera rig)")
-    print(f"  Frames:  {len(new_frames)} (one per image)")
+    if not args.skip_rigs_frames:
+        print(f"  Rigs:    {len(new_rigs)} (single-camera rig)")
+        print(f"  Frames:  {len(new_frames)} (one per image)")
+    else:
+        print(f"  Rigs:    skipped")
+        print(f"  Frames:  skipped")
     print(f"  Points:  {len(sparse_points)} (RGB world frame)")
     print(f"{'=' * 60}")
     
