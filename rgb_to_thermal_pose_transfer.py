@@ -123,6 +123,35 @@ def write_points3D_binary(points, path):
             write_next_bytes(fid, [pt_id] + list(pt["xyz"]) + list(pt["rgb"]) + [pt["error"]], "QdddBBBd")
             write_next_bytes(fid, [0], "Q")
 
+def write_rigs_binary(rigs, path):
+    """Write COLMAP 4.x rigs.bin.
+    rigs: dict {rig_id: [(camera_id, ref_tvec_3), ...]}
+    Each rig has one or more cameras with reference translations.
+    """
+    with open(path, "wb") as fid:
+        write_next_bytes(fid, [len(rigs)], "Q")
+        for rig_id in sorted(rigs.keys()):
+            cameras = rigs[rig_id]
+            write_next_bytes(fid, [rig_id, len(cameras)], "II")
+            for camera_id, ref_tvec in cameras:
+                write_next_bytes(fid, [camera_id], "I")
+                write_next_bytes(fid, list(ref_tvec), "ddd")
+
+def write_frames_binary(frames, path):
+    """Write COLMAP 4.x frames.bin.
+    frames: dict {frame_id: (rig_id, [(data_id, camera_id), ...])}
+    Each frame belongs to a rig and has one or more data_ids.
+    data_id is the image_id, camera_id is which camera in the rig.
+    """
+    with open(path, "wb") as fid:
+        write_next_bytes(fid, [len(frames)], "Q")
+        for frame_id in sorted(frames.keys()):
+            rig_id, data_ids = frames[frame_id]
+            write_next_bytes(fid, [frame_id, rig_id, len(data_ids)], "III")
+            for data_id, camera_id in data_ids:
+                write_next_bytes(fid, [data_id], "Q")
+                write_next_bytes(fid, [camera_id], "I")
+
 def get_base_stem(filename):
     """
     Extract the base stem from DJI filename (legacy, used for sorting).
@@ -323,7 +352,7 @@ def main():
         thermal_poses[i] = {
             "qvec": rgb_img["qvec"],
             "tvec": rgb_img["tvec"],
-            "camera_id": i + 1 if args.per_image_camera else 1,  # per-image or shared
+            "camera_id": 1,
             "name": thermal_files[i]
         }
     
@@ -357,7 +386,7 @@ def main():
             thermal_poses[i] = {
                 "qvec": qvec_interp,
                 "tvec": tvec_interp,
-                "camera_id": i + 1 if args.per_image_camera else 1,
+                "camera_id": 1,
                 "name": thermal_files[i]
             }
             interpolated += 1
@@ -366,7 +395,7 @@ def main():
             thermal_poses[i] = {
                 "qvec": thermal_poses[before_idx]["qvec"].copy(),
                 "tvec": thermal_poses[before_idx]["tvec"].copy(),
-                "camera_id": i + 1 if args.per_image_camera else 1,
+                "camera_id": 1,
                 "name": thermal_files[i]
             }
             interpolated += 1
@@ -375,7 +404,7 @@ def main():
             thermal_poses[i] = {
                 "qvec": thermal_poses[after_idx]["qvec"].copy(),
                 "tvec": thermal_poses[after_idx]["tvec"].copy(),
-                "camera_id": i + 1 if args.per_image_camera else 1,
+                "camera_id": 1,
                 "name": thermal_files[i]
             }
             interpolated += 1
@@ -440,20 +469,30 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # cameras.bin: Thermal intrinsics
-    if args.per_image_camera:
-        # Create one camera per image (all identical intrinsics)
-        # This avoids COLMAP 4.x frame/rig compatibility issues
-        new_cameras = {}
-        for img_id in sorted(new_thermal_images.keys()):
-            cam = dict(th_cam)  # copy intrinsics
-            cam["id"] = img_id  # each image gets its own camera_id
-            new_cameras[img_id] = cam
-        print(f"[INFO] Created {len(new_cameras)} cameras (one per image, all same intrinsics)")
-    else:
-        new_cameras = {1: th_cam}
-        print(f"[INFO] Created 1 shared camera")
+    # cameras.bin: Thermal intrinsics (1 shared camera for COLMAP 4.x compatibility)
+    # COLMAP 4.x point_triangulator requires matching frame/rig structures,
+    # so we use 1 shared camera + explicit frames/rigs files.
+    new_cameras = {1: th_cam}
     write_cameras_binary(new_cameras, os.path.join(args.output_dir, "cameras.bin"))
+    print(f"[INFO] Created 1 shared camera")
+
+    # Ensure all images reference camera_id=1
+    for img_id in new_thermal_images:
+        new_thermal_images[img_id]["camera_id"] = 1
+
+    # rigs.bin: 1 rig with 1 camera (single-camera rig)
+    # rig_id=1 matches what COLMAP 4.x feature_extractor creates
+    new_rigs = {1: [(1, [0.0, 0.0, 0.0])]}  # rig_id=1, camera_id=1, ref_tvec=[0,0,0]
+    write_rigs_binary(new_rigs, os.path.join(args.output_dir, "rigs.bin"))
+    print(f"[INFO] Created 1 rig (single-camera)")
+
+    # frames.bin: 305 frames, each with 1 data_id
+    # frame_id = image_id, rig_id = 1, data_id = (image_id, camera_id=1)
+    new_frames = {}
+    for img_id in sorted(new_thermal_images.keys()):
+        new_frames[img_id] = (1, [(img_id, 1)])  # rig_id=1, data_ids=[(img_id, camera_id=1)]
+    write_frames_binary(new_frames, os.path.join(args.output_dir, "frames.bin"))
+    print(f"[INFO] Created {len(new_frames)} frames")
     
     # images.bin: RGB poses + Thermal filenames + Thermal camera_id
     write_images_binary(new_thermal_images, os.path.join(args.output_dir, "images.bin"))
@@ -463,8 +502,10 @@ def main():
     
     print(f"\n{'=' * 60}")
     print(f"DONE! Output at {args.output_dir}")
-    print(f"  Cameras: {len(new_cameras)} ({'per-image' if args.per_image_camera else 'shared'} Thermal intrinsics)")
+    print(f"  Cameras: {len(new_cameras)} (shared Thermal intrinsics)")
     print(f"  Images:  {len(new_thermal_images)} (305 with RGB poses)")
+    print(f"  Rigs:    {len(new_rigs)} (single-camera rig)")
+    print(f"  Frames:  {len(new_frames)} (one per image)")
     print(f"  Points:  {len(sparse_points)} (RGB world frame)")
     print(f"{'=' * 60}")
     
