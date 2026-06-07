@@ -335,19 +335,46 @@ def main():
     if args.database_path and os.path.exists(args.database_path):
         import sqlite3
         print("=" * 60)
-        print("[STEP 2b] Reading image_id mapping from database...")
+        print("[STEP 2b] Reading image_id mapping from database & cleaning frame/rig data...")
         print("=" * 60)
         conn = sqlite3.connect(args.database_path)
         cursor = conn.cursor()
+        
+        # Read image_id mapping
         cursor.execute('SELECT image_id, name FROM images')
         db_image_id_map = {}
         for row in cursor.fetchall():
             db_image_id_map[row[1]] = row[0]
-        conn.close()
         print(f"[INFO] Read {len(db_image_id_map)} image_id mappings from database")
+        
         # Show first 5 for verification
         for name, iid in sorted(db_image_id_map.items(), key=lambda x: x[1])[:5]:
             print(f"  db: image_id={iid} -> {name}")
+        
+        # CRITICAL: Clean frame/rig data from database
+        # COLMAP 4.x point_triangulator requires frame/rig consistency between
+        # database and sparse files. Since we skip writing rigs.bin/frames.bin,
+        # we must also remove frame/rig data from the database.
+        try:
+            cursor.execute('SELECT COUNT(*) FROM frames')
+            num_frames = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) FROM rigs')
+            num_rigs = cursor.fetchone()[0]
+            print(f"[INFO] Database has {num_frames} frames and {num_rigs} rigs - cleaning them")
+            
+            cursor.execute('DELETE FROM frames')
+            cursor.execute('DELETE FROM rigs')
+            conn.commit()
+            
+            cursor.execute('SELECT COUNT(*) FROM frames')
+            cursor.execute('SELECT COUNT(*) FROM rigs')
+            print(f"[INFO] After cleanup: 0 frames, 0 rigs")
+        except Exception as e:
+            print(f"[WARNING] Could not clean frames/rigs: {e}")
+        
+        conn.close()
+        print(f"[INFO] Database image_ids will be used in sparse files for consistency")
+        print(f"[INFO] Database frame/rig data cleaned - both sides now have no frame/rig")
     elif args.database_path:
         print(f"[WARNING] Database not found at {args.database_path}, will use sequential IDs")
     
