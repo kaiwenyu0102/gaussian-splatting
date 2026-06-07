@@ -125,9 +125,8 @@ def write_points3D_binary(points, path):
 
 def get_base_stem(filename):
     """
-    Extract the base stem from DJI filename.
+    Extract the base stem from DJI filename (legacy, used for sorting).
     DJI_20230103153418_0002_W.JPG -> DJI_20230103153418_0002
-    DJI_20230103153418_0002_T.JPG -> DJI_20230103153418_0002
     """
     stem = Path(filename).stem
     if stem.endswith("_W"):
@@ -135,6 +134,83 @@ def get_base_stem(filename):
     elif stem.endswith("_T"):
         return stem[:-2]
     return stem
+
+def get_seq_number(filename):
+    """Extract sequence number from DJI filename for matching and sorting.
+    DJI_20230103153428_0006_T.JPG -> 6
+    DJI_20230103153427_0006_W.JPG -> 6
+    RGB and Thermal share the same sequence number but differ in timestamp.
+    """
+    stem = Path(filename).stem
+    # Remove _W or _T suffix
+    if stem.endswith("_W") or stem.endswith("_T"):
+        stem = stem[:-2]
+    # Split by underscore: DJI, YYYYMMDDHHMMSS, NNNN
+    parts = stem.split("_")
+    try:
+        return int(parts[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def qvec2rotmat(qvec):
+    return np.array([
+        [1 - 2*qvec[2]**2 - 2*qvec[3]**2, 2*qvec[1]*qvec[2] - 2*qvec[0]*qvec[3], 2*qvec[3]*qvec[1] + 2*qvec[0]*qvec[2]],
+        [2*qvec[1]*qvec[2] + 2*qvec[0]*qvec[3], 1 - 2*qvec[1]**2 - 2*qvec[3]**2, 2*qvec[2]*qvec[3] - 2*qvec[0]*qvec[1]],
+        [2*qvec[3]*qvec[1] - 2*qvec[0]*qvec[2], 2*qvec[2]*qvec[3] + 2*qvec[0]*qvec[1], 1 - 2*qvec[1]**2 - 2*qvec[2]**2]
+    ])
+
+def rotmat2qvec(R):
+    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
+    K = np.array([
+        [Rxx - Ryy - Rzz, 0, 0, 0],
+        [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
+        [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
+        [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz]]) / 3.0
+    eigvals, eigvecs = np.linalg.eigh(K)
+    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
+    if qvec[0] < 0:
+        qvec *= -1
+    return qvec
+
+def slerp(q0, q1, t):
+    """Spherical linear interpolation between two quaternions."""
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = np.dot(q0, q1)
+    if dot < 0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return result / np.linalg.norm(result)
+    theta_0 = np.arccos(dot)
+    theta = theta_0 * t
+    sin_theta = np.sin(theta)
+    sin_theta_0 = np.sin(theta_0)
+    s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    result = s0 * q0 + s1 * q1
+    return result / np.linalg.norm(result)
+
+def interpolate_pose(img_before, img_after, t):
+    """
+    Interpolate a camera pose between two images.
+    t in [0, 1]: 0 = img_before pose, 1 = img_after pose.
+    Uses SLERP for rotation and linear interpolation for translation.
+    """
+    qvec_before = img_before["qvec"]
+    qvec_after = img_after["qvec"]
+    tvec_before = img_before["tvec"]
+    tvec_after = img_after["tvec"]
+    
+    # SLERP for quaternion (rotation)
+    qvec_interp = slerp(qvec_before, qvec_after, t)
+    
+    # Linear interpolation for translation
+    tvec_interp = (1 - t) * tvec_before + t * tvec_after
+    
+    return qvec_interp, tvec_interp
 
 
 def main():
@@ -160,11 +236,13 @@ def main():
     rgb_images = read_images_binary(os.path.join(args.rgb_sparse_dir, "images.bin"))
     print(f"[INFO] RGB: {len(rgb_cameras)} cameras, {len(rgb_images)} images registered")
     
-    # Build lookup: base_stem -> rgb_image
-    rgb_by_base = {}
+    # Build lookup: seq_number -> rgb_image
+    # RGB and Thermal share the same sequence number (e.g., 0006)
+    # but have different timestamps (RGB may be 1 sec earlier)
+    rgb_by_seq = {}
     for rid, rimg in rgb_images.items():
-        base = get_base_stem(rimg["name"])
-        rgb_by_base[base] = rimg
+        seq = get_seq_number(rimg["name"])
+        rgb_by_seq[seq] = rimg
     
     # ============================================================
     # STEP 2: Get Thermal camera intrinsics
@@ -208,44 +286,112 @@ def main():
     print(f"[INFO] RGB params: {rgb_cam['params']}")
     
     # ============================================================
-    # STEP 3: For each Thermal image, use its corresponding RGB
-    #          image's pose directly (same drone, small offset)
+    # STEP 3: Assign poses to ALL Thermal images
+    #   - Matched with RGB -> use RGB pose directly
+    #   - No RGB match -> interpolate from nearest neighbors
     # ============================================================
     print("=" * 60)
-    print("[STEP 3] Assigning RGB poses to Thermal images...")
+    print("[STEP 3] Assigning poses to all 305 Thermal images...")
     print("=" * 60)
     
-    new_thermal_images = {}
-    thermal_files = sorted(os.listdir(args.thermal_input_dir))
+    # Sort thermal files by sequence number (flight order)
+    thermal_files = sorted(os.listdir(args.thermal_input_dir), key=get_seq_number)
     
-    matched = 0
-    skipped = 0
+    # First pass: assign RGB poses where available (match by sequence number)
+    matched_indices = []  # (index, rgb_img) for images with RGB match
+    unmatched_indices = []  # indices without RGB match
     
-    new_id = 1
-    for th_file in thermal_files:
-        th_base = get_base_stem(th_file)
+    for i, th_file in enumerate(thermal_files):
+        th_seq = get_seq_number(th_file)
+        if th_seq in rgb_by_seq:
+            matched_indices.append((i, rgb_by_seq[th_seq]))
+        else:
+            unmatched_indices.append(i)
+    
+    print(f"[INFO] Directly matched with RGB: {len(matched_indices)}")
+    print(f"[INFO] Need pose interpolation: {len(unmatched_indices)}")
+    
+    # Build pose array for all thermal files
+    # Each entry: {"qvec": ..., "tvec": ..., "camera_id": 1, "name": ...}
+    thermal_poses = [None] * len(thermal_files)
+    
+    # Assign matched poses
+    for i, rgb_img in matched_indices:
+        thermal_poses[i] = {
+            "qvec": rgb_img["qvec"],
+            "tvec": rgb_img["tvec"],
+            "camera_id": 1,
+            "name": thermal_files[i]
+        }
+    
+    
+    # Interpolate poses for unmatched images
+    # For each unmatched image, find nearest matched neighbors before and after
+    matched_idx_set = {i for i, _ in matched_indices}
+    matched_idx_sorted = sorted(matched_idx_set)
+    
+    interpolated = 0
+    for i in unmatched_indices:
+        # Find nearest matched neighbor before
+        before_idx = None
+        for j in reversed(matched_idx_sorted):
+            if j < i:
+                before_idx = j
+                break
         
-        if th_base in rgb_by_base:
-            rgb_img = rgb_by_base[th_base]
-            
-            # Directly use RGB W2C pose for Thermal
-            # The physical offset between RGB and Thermal cameras on DJI
-            # is very small (<10cm, <5deg), so this approximation works.
-            # 3DGS training optimizes Gaussian positions to compensate.
-            new_thermal_images[new_id] = {
-                "id": new_id,
-                "qvec": rgb_img["qvec"],     # RGB rotation
-                "tvec": rgb_img["tvec"],     # RGB translation
-                "camera_id": 1,              # Use Thermal camera intrinsics!
-                "name": th_file              # Thermal filename
+        # Find nearest matched neighbor after
+        after_idx = None
+        for j in matched_idx_sorted:
+            if j > i:
+                after_idx = j
+                break
+        
+        if before_idx is not None and after_idx is not None:
+            # Interpolate between before and after
+            t = (i - before_idx) / (after_idx - before_idx)
+            qvec_interp, tvec_interp = interpolate_pose(
+                thermal_poses[before_idx], thermal_poses[after_idx], t)
+            thermal_poses[i] = {
+                "qvec": qvec_interp,
+                "tvec": tvec_interp,
+                "camera_id": 1,
+                "name": thermal_files[i]
             }
-            matched += 1
+            interpolated += 1
+        elif before_idx is not None:
+            # Only have before -> use before's pose
+            thermal_poses[i] = {
+                "qvec": thermal_poses[before_idx]["qvec"].copy(),
+                "tvec": thermal_poses[before_idx]["tvec"].copy(),
+                "camera_id": 1,
+                "name": thermal_files[i]
+            }
+            interpolated += 1
+        elif after_idx is not None:
+            # Only have after -> use after's pose
+            thermal_poses[i] = {
+                "qvec": thermal_poses[after_idx]["qvec"].copy(),
+                "tvec": thermal_poses[after_idx]["tvec"].copy(),
+                "camera_id": 1,
+                "name": thermal_files[i]
+            }
+            interpolated += 1
+        else:
+            print(f"[WARNING] Cannot assign pose to {thermal_files[i]}, no neighbors available")
+    
+    # Build final dict
+    new_thermal_images = {}
+    new_id = 1
+    skipped = 0
+    for i, pose in enumerate(thermal_poses):
+        if pose is not None:
+            pose["id"] = new_id
+            new_thermal_images[new_id] = pose
             new_id += 1
         else:
-            print(f"[WARNING] No RGB match for {th_file} (base={th_base}), skipping")
             skipped += 1
     
-    print(f"[INFO] Matched: {matched}, Skipped: {skipped}")
+    print(f"[INFO] Matched: {len(matched_indices)}, Interpolated: {interpolated}, Skipped: {skipped}")
     print(f"[INFO] Total thermal images with poses: {len(new_thermal_images)}")
     
     if len(new_thermal_images) < 100:
