@@ -224,6 +224,9 @@ def main():
         help="Thermal camera params as 'MODEL,W,H,fx,fy,cx,cy,...' "
              "e.g. 'PINHOLE,1280,1024,1515.32,1515.32,640,512' "
              "Overrides --thermal_sparse_dir for intrinsics")
+    parser.add_argument("--per_image_camera", action="store_true",
+        help="Create one camera per image (all with same intrinsics). "
+             "Required for COLMAP 4.x point_triangulator compatibility (avoids frame/rig conflicts).")
     args = parser.parse_args()
     
     # ============================================================
@@ -320,7 +323,7 @@ def main():
         thermal_poses[i] = {
             "qvec": rgb_img["qvec"],
             "tvec": rgb_img["tvec"],
-            "camera_id": 1,
+            "camera_id": i + 1 if args.per_image_camera else 1,  # per-image or shared
             "name": thermal_files[i]
         }
     
@@ -354,7 +357,7 @@ def main():
             thermal_poses[i] = {
                 "qvec": qvec_interp,
                 "tvec": tvec_interp,
-                "camera_id": 1,
+                "camera_id": i + 1 if args.per_image_camera else 1,
                 "name": thermal_files[i]
             }
             interpolated += 1
@@ -363,7 +366,7 @@ def main():
             thermal_poses[i] = {
                 "qvec": thermal_poses[before_idx]["qvec"].copy(),
                 "tvec": thermal_poses[before_idx]["tvec"].copy(),
-                "camera_id": 1,
+                "camera_id": i + 1 if args.per_image_camera else 1,
                 "name": thermal_files[i]
             }
             interpolated += 1
@@ -372,7 +375,7 @@ def main():
             thermal_poses[i] = {
                 "qvec": thermal_poses[after_idx]["qvec"].copy(),
                 "tvec": thermal_poses[after_idx]["tvec"].copy(),
-                "camera_id": 1,
+                "camera_id": i + 1 if args.per_image_camera else 1,
                 "name": thermal_files[i]
             }
             interpolated += 1
@@ -437,8 +440,19 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # cameras.bin: Thermal intrinsics (different FOV from RGB!)
-    new_cameras = {1: th_cam}
+    # cameras.bin: Thermal intrinsics
+    if args.per_image_camera:
+        # Create one camera per image (all identical intrinsics)
+        # This avoids COLMAP 4.x frame/rig compatibility issues
+        new_cameras = {}
+        for img_id in sorted(new_thermal_images.keys()):
+            cam = dict(th_cam)  # copy intrinsics
+            cam["id"] = img_id  # each image gets its own camera_id
+            new_cameras[img_id] = cam
+        print(f"[INFO] Created {len(new_cameras)} cameras (one per image, all same intrinsics)")
+    else:
+        new_cameras = {1: th_cam}
+        print(f"[INFO] Created 1 shared camera")
     write_cameras_binary(new_cameras, os.path.join(args.output_dir, "cameras.bin"))
     
     # images.bin: RGB poses + Thermal filenames + Thermal camera_id
@@ -449,8 +463,8 @@ def main():
     
     print(f"\n{'=' * 60}")
     print(f"DONE! Output at {args.output_dir}")
-    print(f"  Cameras: {len(new_cameras)} (Thermal intrinsics)")
-    print(f"  Images:  {len(new_thermal_images)} (RGB poses)")
+    print(f"  Cameras: {len(new_cameras)} ({'per-image' if args.per_image_camera else 'shared'} Thermal intrinsics)")
+    print(f"  Images:  {len(new_thermal_images)} (305 with RGB poses)")
     print(f"  Points:  {len(sparse_points)} (RGB world frame)")
     print(f"{'=' * 60}")
     
