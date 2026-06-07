@@ -141,9 +141,13 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Transfer RGB poses to Thermal images")
     parser.add_argument("--rgb_sparse_dir", required=True, help="RGB COLMAP sparse/0 directory")
-    parser.add_argument("--thermal_sparse_dir", required=True, help="Thermal COLMAP sparse/0 directory (for intrinsics only)")
+    parser.add_argument("--thermal_sparse_dir", default=None, help="Thermal COLMAP sparse/0 directory (for intrinsics, optional if --thermal_camera_params provided)")
     parser.add_argument("--thermal_input_dir", required=True, help="Thermal input images directory")
     parser.add_argument("--output_dir", required=True, help="Output directory for new Thermal sparse/0")
+    parser.add_argument("--thermal_camera_params", default=None,
+        help="Thermal camera params as 'MODEL,W,H,fx,fy,cx,cy,...' "
+             "e.g. 'PINHOLE,1280,1024,1515.32,1515.32,640,512' "
+             "Overrides --thermal_sparse_dir for intrinsics")
     args = parser.parse_args()
     
     # ============================================================
@@ -163,20 +167,36 @@ def main():
         rgb_by_base[base] = rimg
     
     # ============================================================
-    # STEP 2: Read Thermal intrinsics (we ONLY need camera intrinsics,
-    #          NOT the thermal poses - all poses come from RGB)
+    # STEP 2: Get Thermal camera intrinsics
     # ============================================================
     print("=" * 60)
-    print("[STEP 2] Reading Thermal camera intrinsics...")
+    print("[STEP 2] Getting Thermal camera intrinsics...")
     print("=" * 60)
-    th_cam_path = os.path.join(args.thermal_sparse_dir, "cameras.bin")
     
-    if not os.path.exists(th_cam_path):
-        print("[ERROR] Thermal cameras.bin not found. Run COLMAP on thermal first (even partial).")
+    if args.thermal_camera_params:
+        # Parse manually specified camera params
+        parts = args.thermal_camera_params.split(",")
+        model_name = parts[0]
+        width = int(parts[1])
+        height = int(parts[2])
+        params = [float(p) for p in parts[3:]]
+        th_cam = {"id": 1, "model": model_name, "width": width, "height": height, "params": params}
+        print(f"[INFO] Using manually specified Thermal camera intrinsics")
+    elif args.thermal_sparse_dir:
+        th_cam_path = os.path.join(args.thermal_sparse_dir, "cameras.bin")
+        if os.path.exists(th_cam_path):
+            thermal_cameras = read_cameras_binary(th_cam_path)
+            th_cam = thermal_cameras[1]
+            print(f"[INFO] Using Thermal camera intrinsics from COLMAP reconstruction")
+        else:
+            print("[ERROR] Thermal cameras.bin not found and no --thermal_camera_params provided.")
+            print("[HINT] Re-run COLMAP on thermal, or use --thermal_camera_params like:")
+            print("       --thermal_camera_params PINHOLE,1280,1024,1515.32,1515.32,640,512")
+            sys.exit(1)
+    else:
+        print("[ERROR] Either --thermal_sparse_dir or --thermal_camera_params must be provided.")
         sys.exit(1)
     
-    thermal_cameras = read_cameras_binary(th_cam_path)
-    th_cam = thermal_cameras[1]
     print(f"[INFO] Thermal camera: model={th_cam['model']}, "
           f"width={th_cam['width']}, height={th_cam['height']}")
     print(f"[INFO] Thermal params: {th_cam['params']}")
