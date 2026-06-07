@@ -259,6 +259,10 @@ def main():
     parser.add_argument("--skip_rigs_frames", action="store_true",
         help="Skip writing rigs.bin and frames.bin. Use this when running "
              "point_triangulator after cleaning database frame/rig data.")
+    parser.add_argument("--database_path", default=None,
+        help="COLMAP database.db path. If provided, read image_id-to-name "
+             "mapping from database to ensure image_ids match. This is "
+             "REQUIRED for COLMAP 4.x point_triangulator compatibility.")
     args = parser.parse_args()
     
     # ============================================================
@@ -319,6 +323,33 @@ def main():
     print(f"[INFO] RGB camera for comparison: model={rgb_cam['model']}, "
           f"width={rgb_cam['width']}, height={rgb_cam['height']}")
     print(f"[INFO] RGB params: {rgb_cam['params']}")
+    
+    # ============================================================
+    # STEP 2b: Read image_id mapping from database (if provided)
+    # ============================================================
+    # COLMAP 4.x assigns image_ids based on the order images are
+    # processed by feature_extractor, NOT by filename sorting.
+    # Our sparse files MUST use the SAME image_ids as the database
+    # to avoid frame/rig DataIds conflicts in point_triangulator.
+    db_image_id_map = None  # {filename: image_id}
+    if args.database_path and os.path.exists(args.database_path):
+        import sqlite3
+        print("=" * 60)
+        print("[STEP 2b] Reading image_id mapping from database...")
+        print("=" * 60)
+        conn = sqlite3.connect(args.database_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT image_id, name FROM images')
+        db_image_id_map = {}
+        for row in cursor.fetchall():
+            db_image_id_map[row[1]] = row[0]
+        conn.close()
+        print(f"[INFO] Read {len(db_image_id_map)} image_id mappings from database")
+        # Show first 5 for verification
+        for name, iid in sorted(db_image_id_map.items(), key=lambda x: x[1])[:5]:
+            print(f"  db: image_id={iid} -> {name}")
+    elif args.database_path:
+        print(f"[WARNING] Database not found at {args.database_path}, will use sequential IDs")
     
     # ============================================================
     # STEP 3: Assign poses to ALL Thermal images
@@ -415,19 +446,49 @@ def main():
             print(f"[WARNING] Cannot assign pose to {thermal_files[i]}, no neighbors available")
     
     # Build final dict
+    # IMPORTANT: image_ids must match the database for COLMAP 4.x compatibility.
+    # If db_image_id_map is provided, use database image_ids.
+    # Otherwise, use sequential IDs (sorted by sequence number).
     new_thermal_images = {}
-    new_id = 1
     skipped = 0
+    id_mismatch_count = 0
     for i, pose in enumerate(thermal_poses):
         if pose is not None:
-            pose["id"] = new_id
-            new_thermal_images[new_id] = pose
-            new_id += 1
+            if db_image_id_map and pose["name"] in db_image_id_map:
+                # Use database-assigned image_id
+                db_id = db_image_id_map[pose["name"]]
+                pose["id"] = db_id
+                new_thermal_images[db_id] = pose
+            else:
+                # Fallback: sequential ID (only if no database mapping)
+                if db_image_id_map:
+                    id_mismatch_count += 1
+                    print(f"[WARNING] Image {pose['name']} not found in database, using fallback ID")
+                pose["id"] = i + 1
+                new_thermal_images[i + 1] = pose
         else:
             skipped += 1
     
     print(f"[INFO] Matched: {len(matched_indices)}, Interpolated: {interpolated}, Skipped: {skipped}")
     print(f"[INFO] Total thermal images with poses: {len(new_thermal_images)}")
+    if db_image_id_map:
+        print(f"[INFO] Using database image_ids: {len(db_image_id_map) - id_mismatch_count} matched, {id_mismatch_count} fallback")
+        # Verify: show first 5 image_id assignments
+        for iid in sorted(new_thermal_images.keys())[:5]:
+            print(f"  sparse: image_id={iid} -> {new_thermal_images[iid]['name']}")
+        # Cross-check with database
+        db_id_set = set(db_image_id_map.values())
+        sparse_id_set = set(new_thermal_images.keys())
+        if db_id_set == sparse_id_set:
+            print(f"[INFO] Image IDs perfectly match between database and sparse files!")
+        else:
+            print(f"[WARNING] Image ID mismatch! DB has {len(db_id_set)} IDs, sparse has {len(sparse_id_set)} IDs")
+            missing = db_id_set - sparse_id_set
+            extra = sparse_id_set - db_id_set
+            if missing:
+                print(f"  Missing from sparse: {len(missing)} IDs")
+            if extra:
+                print(f"  Extra in sparse: {len(extra)} IDs")
     
     if len(new_thermal_images) < 100:
         print("[ERROR] Too few images with poses. Check filename matching.")
